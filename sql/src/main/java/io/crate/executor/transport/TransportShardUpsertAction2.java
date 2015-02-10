@@ -28,7 +28,12 @@ import io.crate.executor.transport.task.elasticsearch.FieldExtractor;
 import io.crate.executor.transport.task.elasticsearch.FieldExtractorFactory;
 import io.crate.executor.transport.task.elasticsearch.SymbolToFieldExtractor;
 import io.crate.metadata.Functions;
+import io.crate.metadata.ReferenceResolver;
 import io.crate.metadata.doc.DocSysColumns;
+import io.crate.operation.ImplementationSymbolVisitor;
+import io.crate.operation.Input;
+import io.crate.operation.collect.CollectExpression;
+import io.crate.planner.RowGranularity;
 import io.crate.planner.symbol.InputColumn;
 import io.crate.planner.symbol.Reference;
 import org.apache.lucene.util.BytesRef;
@@ -48,6 +53,7 @@ import org.elasticsearch.cluster.routing.ShardIterator;
 import org.elasticsearch.cluster.routing.operation.plain.Preference;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.inject.Singleton;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
@@ -75,30 +81,35 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
-public class TransportShardUpsertAction extends TransportShardReplicationOperationAction<ShardUpsertRequest, ShardUpsertRequest, ShardUpsertResponse> {
+@Singleton
+public class TransportShardUpsertAction2 extends TransportShardReplicationOperationAction<ShardUpsertRequest2, ShardUpsertRequest2, ShardUpsertResponse> {
 
-    private final static String ACTION_NAME = "indices:crate/data/write/upsert";
+    private final static String ACTION_NAME = "indices:crate/data/write/upsert2";
     private final static SymbolToFieldExtractor SYMBOL_TO_FIELD_EXTRACTOR = new SymbolToFieldExtractor(new GetResultFieldExtractorFactory());
 
     private final TransportIndexAction indexAction;
     private final IndicesService indicesService;
     private final Functions functions;
+    private final ImplementationSymbolVisitor implementationVisitor;
 
     @Inject
-    public TransportShardUpsertAction(Settings settings,
-                                      ThreadPool threadPool,
-                                      ClusterService clusterService,
-                                      TransportService transportService,
-                                      ActionFilters actionFilters,
-                                      TransportIndexAction indexAction,
-                                      IndicesService indicesService,
-                                      ShardStateAction shardStateAction,
-                                      Functions functions) {
+    public TransportShardUpsertAction2(Settings settings,
+                                       ThreadPool threadPool,
+                                       ClusterService clusterService,
+                                       TransportService transportService,
+                                       ActionFilters actionFilters,
+                                       TransportIndexAction indexAction,
+                                       IndicesService indicesService,
+                                       ShardStateAction shardStateAction,
+                                       Functions functions,
+                                       ReferenceResolver referenceResolver) {
         super(settings, ACTION_NAME, transportService, clusterService, indicesService, threadPool, shardStateAction, actionFilters);
         this.indexAction = indexAction;
         this.indicesService = indicesService;
         this.functions = functions;
+        implementationVisitor = new ImplementationSymbolVisitor(referenceResolver, functions, RowGranularity.DOC);
     }
 
     @Override
@@ -107,13 +118,13 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
     }
 
     @Override
-    protected ShardUpsertRequest newRequestInstance() {
-        return new ShardUpsertRequest();
+    protected ShardUpsertRequest2 newRequestInstance() {
+        return new ShardUpsertRequest2();
     }
 
     @Override
-    protected ShardUpsertRequest newReplicaRequestInstance() {
-        return new ShardUpsertRequest();
+    protected ShardUpsertRequest2 newReplicaRequestInstance() {
+        return new ShardUpsertRequest2();
     }
 
     @Override
@@ -143,17 +154,17 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
     }
 
     @Override
-    protected PrimaryResponse<ShardUpsertResponse, ShardUpsertRequest> shardOperationOnPrimary(ClusterState clusterState, PrimaryOperationRequest shardRequest) {
+    protected PrimaryResponse<ShardUpsertResponse, ShardUpsertRequest2> shardOperationOnPrimary(ClusterState clusterState, PrimaryOperationRequest shardRequest) {
         ShardUpsertResponse shardUpsertResponse = new ShardUpsertResponse(shardRequest.shardId.getIndex());
-        ShardUpsertRequest request = shardRequest.request;
+        ShardUpsertRequest2 request = shardRequest.request;
         for (int i = 0; i < request.locations().size(); i++) {
             int location = request.locations().get(i);
-            ShardUpsertRequest.Item item = request.items().get(i);
+            ShardUpsertRequest2.Item item = request.items().get(i);
             try {
                 IndexResponse indexResponse = indexItem(
                         request,
                         item, shardRequest.shardId,
-                        item.insertValues() != null, // try insert first
+                        request.insertAssignments() != null, // try insert first
                         0);
                 shardUpsertResponse.add(location,
                         new ShardUpsertResponse.Response(
@@ -184,8 +195,8 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
 
     }
 
-    public IndexResponse indexItem(ShardUpsertRequest request,
-                          ShardUpsertRequest.Item item,
+    public IndexResponse indexItem(ShardUpsertRequest2 request,
+                                   ShardUpsertRequest2.Item item,
                           ShardId shardId,
                           boolean tryInsertFirst,
                           int retryCount) throws ElasticsearchException {
@@ -207,7 +218,7 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
             if (t instanceof VersionConflictEngineException
                     && retryCount < item.retryOnConflict()) {
                 return indexItem(request, item, shardId, false, retryCount + 1);
-            } else if (tryInsertFirst && item.updateAssignments() != null
+            } else if (tryInsertFirst && request.updateAssignments() != null
                     && t instanceof DocumentAlreadyExistsException) {
                 // insert failed, document already exists, try update
                 return indexItem(request, item, shardId, false, 0);
@@ -225,7 +236,7 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
      * TODO: detect a NOOP and return an update response if true
      */
     @SuppressWarnings("unchecked")
-    public IndexRequest prepareUpdate(ShardUpsertRequest request, ShardUpsertRequest.Item item, ShardId shardId) throws ElasticsearchException {
+    public IndexRequest prepareUpdate(ShardUpsertRequest2 request, ShardUpsertRequest2.Item item, ShardId shardId) throws ElasticsearchException {
         IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
         IndexShard indexShard = indexService.shardSafe(shardId.id());
         final GetResult getResult = indexShard.getService().get(request.type(), item.id(),
@@ -249,10 +260,21 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
 
         updatedSourceAsMap = sourceAndContent.v2();
 
-        final SymbolToFieldExtractorContext ctx = new SymbolToFieldExtractorContext(functions, item.updateAssignments().length);
-        Map<String, FieldExtractor> extractors = new HashMap<>(item.updateAssignments().length);
+        // collect inputs
+        ImplementationSymbolVisitor.Context implContext = implementationVisitor.process(request.updateAssignments());
+        Set<CollectExpression<?>> collectExpressions = implContext.collectExpressions();
+        for (CollectExpression<?> collectExpression : collectExpressions) {
+            collectExpression.setNextRow(item.row());
+        }
+
+        // extract references and evaluate assignments
+        final SymbolToFieldExtractor.Context extractorContext = new SymbolToFieldExtractorContext(
+                functions,
+                request.updateAssignments().length,
+                implContext);
+        Map<String, FieldExtractor> extractors = new HashMap<>(request.updateAssignments().length);
         for (int i = 0; i < request.updateColumns().length; i++) {
-            extractors.put(request.updateColumns()[i], SYMBOL_TO_FIELD_EXTRACTOR.convert(item.updateAssignments()[i], ctx));
+            extractors.put(request.updateColumns()[i], SYMBOL_TO_FIELD_EXTRACTOR.convert(request.updateAssignments()[i], extractorContext));
         }
 
         Map<String, Object> pathsToUpdate = new HashMap<>(extractors.size());
@@ -277,18 +299,26 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
         return indexRequest;
     }
 
-    private IndexRequest prepareInsert(ShardUpsertRequest request, ShardUpsertRequest.Item item) throws IOException {
+    private IndexRequest prepareInsert(ShardUpsertRequest2 request, ShardUpsertRequest2.Item item) throws IOException {
+        // collect inputs
+        ImplementationSymbolVisitor.Context ctx = implementationVisitor.process(request.insertAssignments());
+        List<Input<?>> inputs = ctx.topLevelInputs();
+        Set<CollectExpression<?>> collectExpressions = ctx.collectExpressions();
+        for (CollectExpression<?> collectExpression : collectExpressions) {
+            collectExpression.setNextRow(item.row());
+        }
+
         BytesRef rawSource = null;
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
-        for (int i = 0; i < item.insertValues().length; i++) {
-            Reference ref = request.insertColumns()[i];
-            if (ref.info().ident().columnIdent().equals(DocSysColumns.RAW)) {
-                rawSource = (BytesRef)item.insertValues()[i];
+        for (int i = 0; i < inputs.size(); i++) {
+            String columnName = request.insertColumns()[i];
+            if (columnName.equals(DocSysColumns.RAW)) {
+                rawSource = (BytesRef)inputs.get(i).value();
                 break;
             }
-            builder.field(ref.ident().columnIdent().fqn(), item.insertValues()[i]);
+            builder.field(columnName, inputs.get(i).value());
         }
-        IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(item.id()).routing(item.routing())
+        IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(item.id()).routing(request.routing())
                 .create(true).operationThreaded(false);
         if (rawSource != null) {
             indexRequest.source(rawSource.bytes);
@@ -329,17 +359,18 @@ public class TransportShardUpsertAction extends TransportShardReplicationOperati
     }
 
     static class SymbolToFieldExtractorContext extends SymbolToFieldExtractor.Context {
+        private final ImplementationSymbolVisitor.Context implContext;
 
-        public SymbolToFieldExtractorContext(Functions functions, int size) {
+        public SymbolToFieldExtractorContext(Functions functions, int size, ImplementationSymbolVisitor.Context implContext) {
             super(functions, size);
+            this.implContext = implContext;
         }
 
         @Override
         public Object inputValueFor(InputColumn inputColumn) {
-            throw new UnsupportedOperationException("SymbolToFieldExtractorContext does not support resolving InputColumn");
+            return implContext.collectExpressionFor(inputColumn).value();
         }
     }
-
 
 
     static class GetResultFieldExtractorFactory implements FieldExtractorFactory<GetResult, SymbolToFieldExtractor.Context> {

@@ -32,6 +32,7 @@ import io.crate.executor.QueryResult;
 import io.crate.executor.TaskResult;
 import io.crate.executor.task.join.NestedLoopTask;
 import io.crate.executor.transport.task.UpsertByIdTask;
+import io.crate.executor.transport.task.UpsertByIdTask2;
 import io.crate.executor.transport.task.elasticsearch.ESDeleteByQueryTask;
 import io.crate.executor.transport.task.elasticsearch.QueryThenFetchTask;
 import io.crate.metadata.*;
@@ -47,6 +48,7 @@ import io.crate.planner.RowGranularity;
 import io.crate.planner.node.dml.ESDeleteByQueryNode;
 import io.crate.planner.node.dml.ESDeleteNode;
 import io.crate.planner.node.dml.UpsertByIdNode;
+import io.crate.planner.node.dml.UpsertByIdNode2;
 import io.crate.planner.node.dql.*;
 import io.crate.planner.node.dql.join.NestedLoopNode;
 import io.crate.planner.projection.Projection;
@@ -54,8 +56,7 @@ import io.crate.planner.projection.TopNProjection;
 import io.crate.planner.symbol.*;
 import io.crate.test.integration.CrateTestCluster;
 import io.crate.testing.TestingHelpers;
-import io.crate.types.DataType;
-import io.crate.types.DataTypes;
+import io.crate.types.*;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterService;
@@ -101,7 +102,6 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
     }
 
 
-
     @Test
     public void testRemoteCollectTask() throws Exception {
         Map<String, Map<String, Set<Integer>>> locations = new HashMap<>(2);
@@ -127,7 +127,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         assertThat(result.size(), is(2));
         for (ListenableFuture<TaskResult> nodeResult : result) {
             assertEquals(1, nodeResult.get().rows().length);
-            if(!OsUtils.WINDOWS) {
+            if (!OsUtils.WINDOWS) {
                 assertThat((Double) nodeResult.get().rows()[0][0], is(greaterThan(0.0)));
             }
         }
@@ -213,7 +213,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 Arrays.<Symbol>asList(idRef, nameRef),
                 Arrays.<Symbol>asList(nameRef, idRef),
                 new boolean[]{false, false},
-                new Boolean[] { null, null },
+                new Boolean[]{null, null},
                 null, null, WhereClause.MATCH_ALL,
                 null
         );
@@ -253,7 +253,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 Arrays.<Symbol>asList(idRef, nameRef),
                 Arrays.<Symbol>asList(nameRef),
                 new boolean[]{false},
-                new Boolean[] { null },
+                new Boolean[]{null},
                 null, null,
                 new WhereClause(whereClause),
                 null
@@ -307,7 +307,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 Arrays.<Symbol>asList(id_ref, date_ref),
                 Arrays.<Symbol>asList(id_ref),
                 new boolean[]{false},
-                new Boolean[] { null },
+                new Boolean[]{null},
                 null, null,
                 new WhereClause(whereClause),
                 null
@@ -345,7 +345,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 Arrays.<Symbol>asList(partedIdRef, partedNameRef, partedDateRef),
                 Arrays.<Symbol>asList(nameRef),
                 new boolean[]{false},
-                new Boolean[] { null },
+                new Boolean[]{null},
                 null, null,
                 WhereClause.MATCH_ALL,
                 Arrays.asList(partedDateRef.info())
@@ -400,7 +400,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 Arrays.<Symbol>asList(idRef, nameRef),
                 Arrays.<Symbol>asList(nameRef),
                 new boolean[]{false},
-                new Boolean[] { null },
+                new Boolean[]{null},
                 null, null,
                 new WhereClause(whereClause),
                 null
@@ -472,7 +472,51 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
 
         assertThat(objects.length, is(1));
         assertThat((Integer) objects[0][0], is(99));
-        assertThat((String)objects[0][1], is("Marvin"));
+        assertThat((String) objects[0][1], is("Marvin"));
+    }
+
+    @Test
+    public void testInsertWithUpsertByIdTask2() throws Exception {
+        execute("create table characters (id int primary key, name string)");
+        ensureGreen();
+
+        /* insert into characters (id, name) values (99, 'Marvin'); */
+
+        DataType[] dataTypes = new DataType[]{IntegerType.INSTANCE, StringType.INSTANCE};
+        String[] insertColumns = new String[]{"id", "name"};
+        Symbol[] insertAssignments = new Symbol[]{new InputColumn(0), new InputColumn(1)};
+
+        UpsertByIdNode2 updateNode = new UpsertByIdNode2(
+                false,
+                false,
+                dataTypes,
+                null,
+                insertColumns,
+                null,
+                insertAssignments);
+        updateNode.add("characters", "99", "99", new Object[]{99, new BytesRef("Marvin")}, null);
+
+        Plan plan = new IterablePlan(updateNode);
+        Job job = executor.newJob(plan);
+        assertThat(job.tasks().get(0), instanceOf(UpsertByIdTask2.class));
+
+        List<ListenableFuture<TaskResult>> result = executor.execute(job);
+        TaskResult taskResult = result.get(0).get();
+        Object[][] rows = taskResult.rows();
+        assertThat(rows.length, is(1));
+        assertThat(((Long) rows[0][0]), is(1L));
+
+        // verify insertion
+        ImmutableList<Symbol> outputs = ImmutableList.<Symbol>of(idRef, nameRef);
+        ESGetNode getNode = newGetNode("characters", outputs, "99");
+        plan = new IterablePlan(getNode);
+        job = executor.newJob(plan);
+        result = executor.execute(job);
+        Object[][] objects = result.get(0).get().rows();
+
+        assertThat(objects.length, is(1));
+        assertThat((Integer) objects[0][0], is(99));
+        assertThat((String) objects[0][1], is("Marvin"));
     }
 
     @Test
@@ -524,7 +568,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
                 ).execute().actionGet().getHits();
         assertThat(hits.getTotalHits(), is(1L));
         assertThat((Integer) hits.getHits()[0].field("id").getValues().get(0), is(0));
-        assertThat((String)hits.getHits()[0].field("name").getValues().get(0), is("Trillian"));
+        assertThat((String) hits.getHits()[0].field("name").getValues().get(0), is("Trillian"));
     }
 
     @Test
@@ -536,7 +580,7 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[][] rows = result.get(0).get().rows();
 
         assertThat(rows.length, is(1));
-        assertThat((Long)rows[0][0], is(4L));
+        assertThat((Long) rows[0][0], is(4L));
     }
 
     @Test
@@ -574,11 +618,11 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[][] objects = result.get(0).get().rows();
 
         assertThat(objects.length, is(2));
-        assertThat((Integer)objects[0][0], is(99));
-        assertThat((String)objects[0][1], is("Marvin"));
+        assertThat((Integer) objects[0][0], is(99));
+        assertThat((String) objects[0][1], is("Marvin"));
 
-        assertThat((Integer)objects[1][0], is(42));
-        assertThat((String)objects[1][1], is("Deep Thought"));
+        assertThat((Integer) objects[1][0], is(42));
+        assertThat((String) objects[1][1], is("Deep Thought"));
     }
 
     @Test
@@ -644,9 +688,55 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[][] objects = result.get(0).get().rows();
 
         assertThat(objects.length, is(1));
-        assertThat((Integer)objects[0][0], is(5));
-        assertThat((String)objects[0][1], is("Zaphod Beeblebrox"));
-        assertThat((boolean)objects[0][2], is(false));
+        assertThat((Integer) objects[0][0], is(5));
+        assertThat((String) objects[0][1], is("Zaphod Beeblebrox"));
+        assertThat((boolean) objects[0][2], is(false));
+    }
+
+    @Test
+    public void testInsertOnDuplicateWithUpsertByIdTask2() throws Exception {
+        setup.setUpCharacters();
+        /* insert into characters (id, name, female) values (5, 'Zaphod Beeblebrox', false)
+           on duplicate key update set name = 'Zaphod Beeblebrox'; */
+
+        DataType[] dataTypes = new DataType[]{IntegerType.INSTANCE, StringType.INSTANCE, BooleanType.INSTANCE};
+        String[] updateColumns = new String[]{"name"};
+        String[] insertColumns = new String[]{"id", "name", "female"};
+        Symbol[] updateAssignments = new Symbol[]{new InputColumn(1)};
+        Symbol[] insertAssignments = new Symbol[]{new InputColumn(0), new InputColumn(1), new InputColumn(2)};
+
+        UpsertByIdNode2 updateNode = new UpsertByIdNode2(
+                false,
+                false,
+                dataTypes,
+                updateColumns,
+                insertColumns,
+                updateAssignments,
+                insertAssignments);
+
+        updateNode.add("characters", "5", "5", new Object[]{5, new BytesRef("Zaphod Beeblebrox"), false}, null);
+        Plan plan = new IterablePlan(updateNode);
+        Job job = executor.newJob(plan);
+        assertThat(job.tasks().get(0), instanceOf(UpsertByIdTask2.class));
+        List<ListenableFuture<TaskResult>> result = executor.execute(job);
+        TaskResult taskResult = result.get(0).get();
+        Object[][] rows = taskResult.rows();
+
+        assertThat(rows.length, is(1));
+        assertThat(((Long) rows[0][0]), is(1L));
+
+        // verify insert
+        ImmutableList<Symbol> outputs = ImmutableList.<Symbol>of(idRef, nameRef, femaleRef);
+        ESGetNode getNode = newGetNode("characters", outputs, "5");
+        plan = new IterablePlan(getNode);
+        job = executor.newJob(plan);
+        result = executor.execute(job);
+        Object[][] objects = result.get(0).get().rows();
+
+        assertThat(objects.length, is(1));
+        assertThat((Integer) objects[0][0], is(5));
+        assertThat((String) objects[0][1], is("Zaphod Beeblebrox"));
+        assertThat((boolean) objects[0][2], is(false));
     }
 
     @Test
@@ -680,10 +770,56 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[][] objects = result.get(0).get().rows();
 
         assertThat(objects.length, is(1));
-        assertThat((Integer)objects[0][0], is(1));
-        assertThat((String)objects[0][1], is("Arthur"));
+        assertThat((Integer) objects[0][0], is(1));
+        assertThat((String) objects[0][1], is("Arthur"));
         // Existing document is updated
-        assertThat((boolean)objects[0][2], is(true));
+        assertThat((boolean) objects[0][2], is(true));
+    }
+
+    @Test
+    public void testUpdateOnDuplicateWithUpsertByIdTask2() throws Exception {
+        setup.setUpCharacters();
+        /* insert into characters (id, name, female) values (1, 'Zaphod Beeblebrox', false)
+           on duplicate key update name = 'Zaphod Beeblebrox', female = true; */
+        DataType[] dataTypes = new DataType[]{IntegerType.INSTANCE, StringType.INSTANCE, BooleanType.INSTANCE, BooleanType.INSTANCE};
+        String[] updateColumns = new String[]{"name", "female"};
+        String[] insertColumns = new String[]{"id", "name", "female"};
+        Symbol[] updateAssignments = new Symbol[]{new InputColumn(1), new InputColumn(3)};
+        Symbol[] insertAssignments = new Symbol[]{new InputColumn(0), new InputColumn(1), new InputColumn(2)};
+
+        UpsertByIdNode2 updateNode = new UpsertByIdNode2(
+                false,
+                false,
+                dataTypes,
+                updateColumns,
+                insertColumns,
+                updateAssignments,
+                insertAssignments);
+
+        updateNode.add("characters", "1", "1", new Object[]{1, new BytesRef("Zaphod Beeblebrox"), false, true}, null);
+        Plan plan = new IterablePlan(updateNode);
+        Job job = executor.newJob(plan);
+        assertThat(job.tasks().get(0), instanceOf(UpsertByIdTask2.class));
+        List<ListenableFuture<TaskResult>> result = executor.execute(job);
+        TaskResult taskResult = result.get(0).get();
+        Object[][] rows = taskResult.rows();
+
+        assertThat(rows.length, is(1));
+        assertThat(((Long) rows[0][0]), is(1L));
+
+        // verify update
+        ImmutableList<Symbol> outputs = ImmutableList.<Symbol>of(idRef, nameRef, femaleRef);
+        ESGetNode getNode = newGetNode("characters", outputs, "1");
+        plan = new IterablePlan(getNode);
+        job = executor.newJob(plan);
+        result = executor.execute(job);
+        Object[][] objects = result.get(0).get().rows();
+
+        assertThat(objects.length, is(1));
+        assertThat((Integer) objects[0][0], is(1));
+        // Existing document is updated
+        assertThat((String) objects[0][1], is("Zaphod Beeblebrox"));
+        assertThat((boolean) objects[0][2], is(true));
     }
 
     @Test
